@@ -35,15 +35,18 @@
 int pwr_key_pressed = 0;
 
 struct gpio_button_data {
-        const struct gpio_keys_button *button;
-        struct input_dev *input;
-        struct timer_list timer;
-        struct work_struct work;
-        unsigned int timer_debounce;        /* in msecs */
-        unsigned int irq;
-        spinlock_t lock;
-        bool disabled;
-        bool key_pressed;
+	const struct gpio_keys_button *button;
+	struct input_dev *input;
+	struct timer_list timer;
+	struct work_struct work;
+	unsigned int timer_debounce;	/* in msecs */
+	unsigned int irq;
+	spinlock_t lock;
+	bool disabled;
+	bool key_pressed;
+	struct work_struct reset_work;
+	struct timer_list reset_timer;
+	unsigned int timer_hwreset;	/* in msecs */
 };
 
 struct gpio_keys_drvdata {
@@ -336,6 +339,28 @@ static char *key_descriptions[] = {
 };
 #endif
 
+/* Routines for resetkey-transition notifications */
+static BLOCKING_NOTIFIER_HEAD(resetkey_chain_head);
+
+int register_resetkey_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&resetkey_chain_head, nb);
+}
+EXPORT_SYMBOL_GPL(register_resetkey_notifier);
+
+int unregister_resetkey_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&resetkey_chain_head, nb);
+}
+EXPORT_SYMBOL_GPL(unregister_resetkey_notifier);
+
+int resetkey_notifier_call_chain(unsigned long val)
+{
+	int ret = blocking_notifier_call_chain(&resetkey_chain_head, val, NULL);
+
+	return notifier_to_errno(ret);
+}
+
 static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 {
         const struct gpio_keys_button *button = bdata->button;
@@ -374,7 +399,15 @@ static void gpio_keys_gpio_work_func(struct work_struct *work)
 	}
 
 #endif
-        gpio_keys_gpio_report_event(bdata);
+
+	if (button->can_reset) {
+		if (state)
+			mod_timer(&bdata->reset_timer,
+				jiffies + msecs_to_jiffies(bdata->timer_hwreset));
+		else
+			del_timer_sync(&bdata->reset_timer);
+	}
+	gpio_keys_gpio_report_event(bdata);
 }
 
 static void gpio_keys_gpio_timer(unsigned long _data)
@@ -382,6 +415,19 @@ static void gpio_keys_gpio_timer(unsigned long _data)
         struct gpio_button_data *bdata = (struct gpio_button_data *)_data;
 
         schedule_work(&bdata->work);
+}
+
+static void reset_keys_work_func(struct work_struct *work)
+{
+	pr_info("gpio_keys: notify listeners pmic preparing to reset\n");
+	resetkey_notifier_call_chain(RESETKEY_PREPARE_HWREST);
+}
+
+static void powerkey_gpio_timer(unsigned long _data)
+{
+	struct gpio_button_data *bdata = (struct gpio_button_data *)_data;
+
+	schedule_work(&bdata->reset_work);
 }
 
 static irqreturn_t gpio_keys_gpio_isr(int irq, void *dev_id)
@@ -451,96 +497,103 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
                                          struct gpio_button_data *bdata,
                                          const struct gpio_keys_button *button)
 {
-        const char *desc = button->desc ? button->desc : "gpio_keys";
-        struct device *dev = &pdev->dev;
-        irq_handler_t isr;
-        unsigned long irqflags;
-        int irq, error;
+	const char *desc = button->desc ? button->desc : "gpio_keys";
+	struct device *dev = &pdev->dev;
+	irq_handler_t isr;
+	unsigned long irqflags;
+	int irq, error;
 
-        bdata->input = input;
-        bdata->button = button;
-        spin_lock_init(&bdata->lock);
+	bdata->input = input;
+	bdata->button = button;
+	spin_lock_init(&bdata->lock);
 
-        if (gpio_is_valid(button->gpio)) {
+	if (gpio_is_valid(button->gpio)) {
 
-                error = gpio_request(button->gpio, desc);
-                if (error < 0) {
-                        dev_err(dev, "Failed to request GPIO %d, error %d\n",
-                                button->gpio, error);
-                        return error;
-                }
+		error = gpio_request(button->gpio, desc);
+		if (error < 0) {
+			dev_err(dev, "Failed to request GPIO %d, error %d\n",
+				button->gpio, error);
+			return error;
+		}
 
-                error = gpio_direction_input(button->gpio);
-                if (error < 0) {
-                        dev_err(dev,
-                                "Failed to configure direction for GPIO %d, error %d\n",
-                                button->gpio, error);
-                        goto fail;
-                }
+		error = gpio_direction_input(button->gpio);
+		if (error < 0) {
+			dev_err(dev,
+				"Failed to configure direction for GPIO %d, error %d\n",
+				button->gpio, error);
+			goto fail;
+		}
 
-                if (button->debounce_interval) {
-                        error = gpio_set_debounce(button->gpio,
-                                        button->debounce_interval * 1000);
-                        /* use timer if gpiolib doesn't provide debounce */
-                        if (error < 0)
-                                bdata->timer_debounce =
-                                                button->debounce_interval;
-                }
+		if (button->debounce_interval) {
+			error = gpio_set_debounce(button->gpio,
+					button->debounce_interval * 1000);
+			/* use timer if gpiolib doesn't provide debounce */
+			if (error < 0)
+				bdata->timer_debounce =
+						button->debounce_interval;
+		}
 
-                irq = gpio_to_irq(button->gpio);
-                if (irq < 0) {
-                        error = irq;
-                        dev_err(dev,
-                                "Unable to get irq number for GPIO %d, error %d\n",
-                                button->gpio, error);
-                        goto fail;
-                }
-                bdata->irq = irq;
+		irq = gpio_to_irq(button->gpio);
+		if (irq < 0) {
+			error = irq;
+			dev_err(dev,
+				"Unable to get irq number for GPIO %d, error %d\n",
+				button->gpio, error);
+			goto fail;
+		}
+		bdata->irq = irq;
 
-                INIT_WORK(&bdata->work, gpio_keys_gpio_work_func);
-                setup_timer(&bdata->timer,
-                            gpio_keys_gpio_timer, (unsigned long)bdata);
+		INIT_WORK(&bdata->work, gpio_keys_gpio_work_func);
+		setup_timer(&bdata->timer,
+			    gpio_keys_gpio_timer, (unsigned long)bdata);
 
-                isr = gpio_keys_gpio_isr;
-                irqflags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
+		isr = gpio_keys_gpio_isr;
+		irqflags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
 
-        } else {
-                if (!button->irq) {
-                        dev_err(dev, "No IRQ specified\n");
-                        return -EINVAL;
-                }
-                bdata->irq = button->irq;
+		if (button->can_reset) {
+			INIT_WORK(&bdata->reset_work, reset_keys_work_func);
+			bdata->timer_hwreset = button->reset_interval;
+			setup_timer(&bdata->reset_timer, powerkey_gpio_timer,
+					(unsigned long)bdata);
+		}
 
-                if (button->type && button->type != EV_KEY) {
-                        dev_err(dev, "Only EV_KEY allowed for IRQ buttons.\n");
-                        return -EINVAL;
-                }
+	} else {
+		if (!button->irq) {
+			dev_err(dev, "No IRQ specified\n");
+			return -EINVAL;
+		}
+		bdata->irq = button->irq;
 
-                bdata->timer_debounce = button->debounce_interval;
-                setup_timer(&bdata->timer,
-                            gpio_keys_irq_timer, (unsigned long)bdata);
+		if (button->type && button->type != EV_KEY) {
+			dev_err(dev, "Only EV_KEY allowed for IRQ buttons.\n");
+			return -EINVAL;
+		}
 
-                isr = gpio_keys_irq_isr;
-                irqflags = 0;
-        }
+		bdata->timer_debounce = button->debounce_interval;
+		setup_timer(&bdata->timer,
+			    gpio_keys_irq_timer, (unsigned long)bdata);
 
-        input_set_capability(input, button->type ?: EV_KEY, button->code);
+		isr = gpio_keys_irq_isr;
+		irqflags = 0;
+	}
 
-        /*
-         * If platform has specified that the button can be disabled,
-         * we don't want it to share the interrupt line.
-         */
-        if (!button->can_disable)
-                irqflags |= IRQF_SHARED;
+	input_set_capability(input, button->type ?: EV_KEY, button->code);
 
-        error = request_any_context_irq(bdata->irq, isr, irqflags, desc, bdata);
-        if (error < 0) {
-                dev_err(dev, "Unable to claim irq %d; error %d\n",
-                        bdata->irq, error);
-                goto fail;
-        }
+	/*
+	 * If platform has specified that the button can be disabled,
+	 * we don't want it to share the interrupt line.
+	 */
+	if (!button->can_disable)
+		irqflags |= IRQF_SHARED;
 
-        return 0;
+	error = request_any_context_irq(bdata->irq, isr, irqflags, desc, bdata);
+	if (error < 0) {
+		dev_err(dev, "Unable to claim irq %d; error %d\n",
+			bdata->irq, error);
+		goto fail;
+	}
+
+	return 0;
 
 fail:
         if (gpio_is_valid(button->gpio))
