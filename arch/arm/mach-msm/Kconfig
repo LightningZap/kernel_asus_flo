@@ -1592,8 +1592,8 @@ config MSM_SDIO_SMEM
         bool "SDIO SMEM for remote storage"
         help
           Copies data from remote MDM9K memory to local MSM8x60
-      memory. Used by remote storage client to shadow
-      MDM9K filesystem.
+          memory. Used by remote storage client to shadow
+          MDM9K filesystem.
 
 config MSM_DALRPC
     bool "DAL RPC support"
@@ -1955,14 +1955,14 @@ config MSM_PIL_LPASS_QDSP6V5
        depends on MSM_PIL
        help
          Support for booting and shutting down QDSP6v5 (Hexagon) processors
-     in low power audio subsystems.
+         in low power audio subsystems.
 
 config MSM_PIL_MSS_QDSP6V5
        tristate "MSS QDSP6v5 (Hexagon) Boot Support"
        depends on MSM_PIL
        help
          Support for booting and shutting down QDSP6v5 (Hexagon) processors
-     in modem subsystems.
+         in modem subsystems.
 
 config MSM_PIL_MBA
     tristate "Support for modem self-authentication"
@@ -2359,9 +2359,9 @@ config MSM_ADSP_LOADER
     depends on MSM_AUDIO_QDSP6V2 || MSM_AUDIO_QDSP6
         help
           Enable ADSP image loader.
-      The ADSP loader brings ADSP out of reset
-      for the platforms that use APRv2.
-      Say M if you want to enable this module.
+          The ADSP loader brings ADSP out of reset
+          for the platforms that use APRv2.
+          Say M if you want to enable this module.
 
 config MSM_ULTRASOUND
     bool "MSM ultrasound support"
